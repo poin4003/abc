@@ -60,15 +60,17 @@ class ModemSession:
         self.sms_store: List[Dict] = []
         self.sms_store_lock = threading.Lock()
 
+    # ---------- helpers push event ----------
+
     def _push_log(self, text: str):
         if self.event_queue:
             self.event_queue.put(("log", text))
 
     def _push_sms(self, sender: Optional[str], text: str):
-        # đẩy lên GUI
+        # GUI
         if self.event_queue:
             self.event_queue.put(("sms", sender, text))
-        # lưu sms cho API
+        # API
         with self.sms_store_lock:
             self.sms_store.append(
                 {
@@ -78,6 +80,8 @@ class ModemSession:
                     "timestamp": time.time(),
                 }
             )
+
+    # ---------- AT init (blocking, trước listener) ----------
 
     def _send_at_block(self, cmd: str, wait: float = 0.5) -> str:
         """
@@ -99,9 +103,21 @@ class ModemSession:
         return resp.strip()
 
     def _init_modem_for_sms(self):
+        """
+        Cấu hình modem cho SMS text mode:
+        - AT
+        - AT+CMEE=1 (báo lỗi mở rộng)
+        - AT+CMGF=1 (text mode)
+        - AT+CSCS="GSM" (charset)
+        - AT+CSMP=17,167,0,0 (TPDU params cho SMS text)
+        - AT+CNMI=2,2,0,0,0 (đẩy SMS mới lên ngay +CMT)
+        """
         try:
             at_resp = self._send_at_block("AT")
             self._push_log(f"[{self.port}] AT → {at_resp!r}")
+
+            cmee_resp = self._send_at_block("AT+CMEE=1")
+            self._push_log(f"[{self.port}] AT+CMEE=1 → {cmee_resp!r}")
 
             cmgf_resp = self._send_at_block("AT+CMGF=1")
             self._push_log(f"[{self.port}] AT+CMGF=1 → {cmgf_resp!r}")
@@ -109,11 +125,16 @@ class ModemSession:
             cscs_resp = self._send_at_block('AT+CSCS="GSM"')
             self._push_log(f"[{self.port}] AT+CSCS=\"GSM\" → {cscs_resp!r}")
 
+            csmp_resp = self._send_at_block("AT+CSMP=17,167,0,0")
+            self._push_log(f"[{self.port}] AT+CSMP=17,167,0,0 → {csmp_resp!r}")
+
             cnmi_resp = self._send_at_block("AT+CNMI=2,2,0,0,0")
             self._push_log(f"[{self.port}] AT+CNMI=2,2,0,0,0 → {cnmi_resp!r}")
         except Exception as e:
             self._push_log(f"[{self.port}] [ERROR] Init modem failed: {e!r}")
             raise
+
+    # ---------- listener loop ----------
 
     def _listener_loop(self):
         self._push_log(f"[{self.port}] [LISTENER] Start listening...")
@@ -134,13 +155,15 @@ class ModemSession:
                         text_line = self.ser.readline().decode(errors="ignore").strip()
                         self._push_sms(sender, text_line)
                     else:
-                        # Log các dòng khác (USSD +CUSD, response AT, v.v.)
+                        # Log các dòng khác (+CUSD, OK, ERROR, +CMS ERROR, ...)
                         self._push_log(f"[{self.port}] {line}")
                 except Exception as e:
                     self._push_log(f"[{self.port}] [LISTENER ERROR] {e!r}")
                     time.sleep(0.5)
         finally:
             self._push_log(f"[{self.port}] [LISTENER] Stopped.")
+
+    # ---------- lifecycle ----------
 
     def open(self):
         if self.ser and self.ser.is_open:
@@ -160,26 +183,32 @@ class ModemSession:
             self.ser.close()
         self._push_log(f"[{self.port}] [SYSTEM] Disconnected")
 
-    # -------- API actions (thread-safe write) --------
+    # ---------- public actions (API/GUI) ----------
 
     def send_sms(self, phone: str, text: str):
+        """
+        Gửi SMS ở TEXT mode.
+        Response (OK / +CMS ERROR) sẽ được listener log lên.
+        """
         if not self.ser or not self.ser.is_open:
             raise RuntimeError("Modem not connected")
 
         with self.lock:
-            # đảm bảo text mode
-            self.ser.write(b"AT+CMGF=1\r")
-            time.sleep(0.3)
-
+            # CMGF, CSCS, CSMP đã set từ init, không cần set lại mỗi lần.
             cmd = f'AT+CMGS="{phone}"'
-            self.ser.write((cmd + "\r").encode("utf-8"))
+            # gửi lệnh + CRLF
+            self.ser.write((cmd + "\r\n").encode("utf-8"))
             time.sleep(0.5)
-
+            # gửi nội dung + Ctrl+Z
             self.ser.write((text + "\x1A").encode("utf-8"))
 
+        self._push_log(f"[{self.port}] AT+CMGS=\"{phone}\"")
         self._push_log(f"[{self.port}] [SEND_SMS] To {phone}: {text}")
 
     def send_ussd(self, ussd_code: str):
+        """
+        Gửi USSD; response +CUSD sẽ được listener log.
+        """
         if not self.ser or not self.ser.is_open:
             raise RuntimeError("Modem not connected")
 
@@ -187,7 +216,7 @@ class ModemSession:
             self.ser.write(b'AT+CSCS="GSM"\r')
             time.sleep(0.2)
             cmd = f'AT+CUSD=1,"{ussd_code}",15'
-            self.ser.write((cmd + "\r").encode("utf-8"))
+            self.ser.write((cmd + "\r\n").encode("utf-8"))
 
         self._push_log(f"[{self.port}] [USSD] Sent {ussd_code}")
 
@@ -231,7 +260,7 @@ class SessionManager:
             del self.sessions[port]
 
 
-# global sẽ được gán sau khi GUI tạo event_queue
+# global session manager, sẽ gán khi GUI khởi tạo
 session_manager: Optional[SessionManager] = None
 
 
@@ -425,6 +454,8 @@ class SimGuiApp(tk.Tk):
 
         self.refresh_ports()
 
+    # ---------- GUI helpers ----------
+
     def refresh_ports(self):
         ports = list_ports.comports()
         values = [p.device for p in ports]
@@ -443,9 +474,9 @@ class SimGuiApp(tk.Tk):
             messagebox.showerror("Error", "Session manager not ready")
             return
 
-        # Nếu đang chưa connect -> connect
         sessions = session_manager.list_sessions()
         if port not in sessions:
+            # connect
             try:
                 session_manager.connect(port)
                 self.btn_connect.config(text="Disconnect")
@@ -453,7 +484,7 @@ class SimGuiApp(tk.Tk):
             except Exception as e:
                 messagebox.showerror("Error", f"Failed to connect {port}:\n{e}")
         else:
-            # đang connect -> disconnect
+            # disconnect
             try:
                 session_manager.disconnect(port)
                 self.btn_connect.config(text="Connect")
@@ -493,6 +524,8 @@ class SimGuiApp(tk.Tk):
             pass
 
         self.after(200, self._poll_events)
+
+    # ---------- GUI actions ----------
 
     def on_send_sms(self):
         port = self.combobox_port.get()
